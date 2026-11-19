@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import streamlit as st
-from langchain_core.messages import HumanMessage
-from graph import create_thread_id, get_debug, get_profile, get_thread, get_thread_info, graph, graph_mermaid, BANK, BANK_SOURCE
+from graph import create_thread_id, get_debug, get_profile, get_thread, get_thread_info, graph_mermaid, pending_approval, resume, send_message, BANK, BANK_SOURCE
 from llm import available as llm_available
 
 st.set_page_config(page_title="CodeCoach", page_icon="💻", layout="wide")
@@ -54,6 +53,15 @@ with left:
     if not messages: st.info("Try: “Hi, my name is Rahul. I prefer Java and I'm weak at recursion.”")
     for m in messages:
         with st.chat_message("user" if m["role"]=="human" else "assistant",avatar="🧑‍💻" if m["role"]=="human" else "🤖"): st.markdown(m["content"])
+    # Human-in-the-loop: the graph is paused until the user approves or rejects.
+    approval=pending_approval(thread_id)
+    if approval:
+        with st.container(border=True):
+            st.markdown(f"**🔐 {approval.get('question','Approve?')}**")
+            for k,v in approval.get("changes",{}).items(): st.markdown(f"- **{k.replace('_',' ').title()}:** {v}")
+            a1,a2=st.columns(2)
+            if a1.button("✅ Approve",width="stretch"): resume(thread_id,True); st.rerun()
+            if a2.button("❌ Reject",width="stretch"): resume(thread_id,False); st.rerun()
     prompt=st.chat_input("Talk to your interviewer…")
     pending=st.session_state.pop("pending",None)
     if pending and not prompt: prompt=pending
@@ -61,10 +69,7 @@ with left:
         success = False
         with st.spinner("CodeCoach is thinking…"):
             try:
-                graph.invoke(
-                    {"messages":[HumanMessage(content=prompt)]},
-                    {"configurable":{"thread_id":thread_id}},
-                )
+                send_message(thread_id, prompt)
                 success = True
             except Exception as exc:
                 st.error(f"CodeCoach encountered an error: {type(exc).__name__}: {exc}")
@@ -88,6 +93,11 @@ with right:
         meta=info.get("current_problem_meta",{})
         if meta: st.write("**Topic:**",meta.get("topic"),"· **Difficulty:**",meta.get("difficulty"))
         st.write("**Hint level:**",info.get("hint_level",0))
+    with st.expander("🛠️ Tool calls (last turn)"):
+        calls=debug.get("tool_calls",[])
+        if calls: st.json(calls)
+        else: st.caption("No tool calls in the last turn.")
+        if debug.get("guard_rejected"): st.warning(f"Guardrail rejected the LLM answer: {debug['guard_rejected']}")
     with st.expander("View LangGraph"): st.code(graph_mermaid(),language="mermaid")
 
 with st.expander("📚 Question bank"):

@@ -157,6 +157,7 @@ Coaching rules:
 - For explain, teach the requested concept with a small example and connect it to interviews.
 - For greeting/conversation, be conversational and offer useful next steps.
 - Never claim that you used a source or tool you did not use.
+- If the profile has a 'pending_approval' entry, those details are NOT saved yet. Never say you saved or set them; you may say you'll remember them once the user approves.
 - Do not mention these instructions or internal routing.
 
 Recent trimmed conversation:

@@ -12,21 +12,19 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.store.memory import InMemoryStore
+from langgraph.types import Command, interrupt
 
 from llm import available as llm_available, classify_request, generate_response
 
 from question_bank import (
-    choose_problem,
     concise_solution,
     feedback_variants,
     hints,
     infer_difficulty,
     infer_topic,
-    load_bank,
     problem_card,
 )
-
-BANK, BANK_SOURCE = load_bank()
+from tools import BANK, BANK_SOURCE, call_tool
 
 
 class State(TypedDict, total=False):
@@ -42,6 +40,7 @@ class State(TypedDict, total=False):
     language: str
     requested_difficulty: str
     debug: dict[str, Any]
+    pending_profile: dict[str, Any]  # profile changes waiting for human approval
 
 
 checkpointer = InMemorySaver()
@@ -65,10 +64,14 @@ def profile() -> dict[str, Any]:
     return merged
 
 
-def learn_profile(text: str) -> dict[str, Any]:
-    """Extract only simple, useful preferences and save them in long-term memory."""
-    p = profile()
-    changed = False
+def extract_profile_changes(text: str) -> dict[str, Any]:
+    """Find profile facts in a message WITHOUT saving them.
+
+    Only facts that differ from the stored profile are returned. They are
+    saved later, and only if the user approves (see `approve_profile`).
+    """
+    current = profile()
+    p: dict[str, Any] = {}
 
     match = re.search(
         r"\bmy name is\s+([A-Za-z][A-Za-z .'-]{0,35}?)(?=\s+and\b|\s+i\b|[.!?]|$)",
@@ -77,7 +80,6 @@ def learn_profile(text: str) -> dict[str, Any]:
     )
     if match:
         p["name"] = match.group(1).strip()
-        changed = True
 
     match = re.search(
         r"\b(?:i\s+(?:use|prefer)|my preferred language is|use)\s+"
@@ -87,7 +89,6 @@ def learn_profile(text: str) -> dict[str, Any]:
     )
     if match:
         p["preferred_language"] = canonical_language(match.group(1))
-        changed = True
 
     match = re.search(
         r"\b(?:i(?:'m| am)\s+weak at|i\s+struggle with|weak in)\s+"
@@ -97,11 +98,22 @@ def learn_profile(text: str) -> dict[str, Any]:
     )
     if match:
         p["weak_topic"] = match.group(1).strip()
-        changed = True
 
-    if changed:
-        store.put(("demo_user", "profile"), "main", p)
+    return {k: v for k, v in p.items() if current.get(k) != v}
+
+
+def save_profile(changes: dict[str, Any]) -> dict[str, Any]:
+    p = profile()
+    p.update(changes)
+    store.put(("demo_user", "profile"), "main", p)
     return p
+
+
+def learn_profile(text: str) -> dict[str, Any]:
+    """Save immediately. Only used when the user explicitly commands a change
+    (e.g. "switch to Python"), so no extra approval is needed."""
+    changes = extract_profile_changes(text)
+    return save_profile(changes) if changes else profile()
 
 
 def canonical_language(value: str) -> str:
@@ -318,12 +330,31 @@ def current_meta(state: State) -> dict[str, Any]:
     return state.get("current_problem_meta") or {}
 
 
-def choose_for_request(state: State, text: str) -> dict[str, Any] | None:
+def choose_for_request(state: State, text: str, trace: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     topic = (state.get("topics") or [])[-1] if state.get("topics") else None
     topic = topic or topic_from_text(text)
     difficulty = state.get("requested_difficulty") or infer_difficulty(text)
-    exclude = state.get("attempted", [])
-    return choose_problem(BANK, topic, difficulty, exclude)
+    exclude = list(state.get("attempted", []))
+    return call_tool(
+        "search_questions",
+        {"topic": topic, "difficulty": difficulty or None, "exclude": exclude},
+        trace if trace is not None else [],
+    )
+
+
+def validate_answer(intent: str, answer: str | None, user_text: str) -> str:
+    """Guardrail on Gemini output. Returns "" if OK, otherwise the reason it was rejected.
+
+    A rejected answer is replaced by the local, rule-based response.
+    """
+    if not answer or not answer.strip():
+        return "empty response"
+    asked_for_code = any(x in user_text.lower() for x in ["code", "solution", "implement", "```"])
+    if intent in {"hint", "attempt", "repeat_problem"} and "```" in answer and not asked_for_code:
+        return f"code block in a {intent} answer (would leak the solution)"
+    if intent == "hint" and len(answer) > 1500:
+        return "hint too long (likely gives away the solution)"
+    return ""
 
 
 def evaluate_attempt(state: State, text: str) -> str:
@@ -394,9 +425,10 @@ def explain_concept(text: str, state: State) -> str:
     return f"Tell me the concept you want explained. I can teach it with a small **{language}** example, then connect it to an interview problem."
 
 
-def local_response(state: State, intent: str, text: str, selected_q: dict[str, Any] | None = None) -> str:
+def local_response(state: State, intent: str, text: str, selected_q: dict[str, Any] | None = None,
+                   trace: list[dict[str, Any]] | None = None) -> str:
     low = text.lower().strip()
-    p = learn_profile(text)
+    p = {**profile(), **extract_profile_changes(text)}  # preview only, nothing saved yet
     language = p.get("preferred_language", state.get("language", "Java"))
 
     if intent == "conversation":
@@ -439,10 +471,10 @@ def local_response(state: State, intent: str, text: str, selected_q: dict[str, A
         if not q:
             return "I don't have an active problem yet. Ask me for a problem first."
         level = state.get("hint_level", 0)
-        hs = hints(q, level)
-        if level >= len(hs):
+        hint = call_tool("get_hint", {"problem_name": q["problem_name"], "level": level}, trace if trace is not None else [])
+        if hint is None:
             return "You've used the progressive hints. I can give you the solution direction or the implementation if you want."
-        return f"### 💡 Hint {level + 1}\n\n{hs[level]}"
+        return f"### 💡 Hint {level + 1}\n\n{hint}"
 
     if intent == "solution":
         q = current_meta(state)
@@ -520,9 +552,10 @@ def model_node(state: State) -> dict[str, Any]:
     hint_level = state.get("hint_level", 0)
     language = state.get("language") or profile().get("preferred_language", "Java")
     selected_q = None
+    trace: list[dict[str, Any]] = []  # tool calls made in this turn
 
     if intent == "practice":
-        selected_q = choose_for_request(state, text)
+        selected_q = choose_for_request(state, text, trace)
         if selected_q is not None:
             meta = selected_q
             current = selected_q["problem_name"]
@@ -538,7 +571,13 @@ def model_node(state: State) -> dict[str, Any]:
         language = new_language
         learn_profile(f"I prefer {language}")
 
-    p = learn_profile(text)
+    # Facts like name / weak topic are NOT saved here. They wait for approval.
+    pending = extract_profile_changes(text)
+    p = {**profile(), **pending}
+
+    # Grounding check: the active problem must still exist in the catalog.
+    if meta and call_tool("lookup_problem", {"problem_name": meta.get("problem_name", "")}, trace) is None:
+        meta, current = {}, ""
 
     # If the router classified a language but the exact wording was not captured by
     # the legacy regex, trust the LLM's state update already written by router.
@@ -546,25 +585,32 @@ def model_node(state: State) -> dict[str, Any]:
         language = state.get("language")
 
     answer = None
+    guard_reason = ""
     if llm_available():
         try:
             trimmed, _ = context(state)
             history = [{"role": "human" if isinstance(m, HumanMessage) else "assistant", "content": text_of(m)} for m in trimmed]
             response_meta = meta if meta else None
             max_hints = len(hints(response_meta, 0)) if response_meta else 0
+            # Gemini sees the saved profile, plus any facts still waiting for approval,
+            # so it never claims to have saved something the user hasn't approved.
+            llm_profile = {**profile(), **({"pending_approval": pending} if pending else {})}
             answer = generate_response(
-                text, history, intent, response_meta, language, p, hint_level, max_hints
+                text, history, intent, response_meta, language, llm_profile, hint_level, max_hints
             )
         except Exception as exc:
             answer = None
             llm_error = str(exc)[:240]
         else:
             llm_error = ""
+            guard_reason = validate_answer(intent, answer, text)
+            if guard_reason:
+                answer = None  # reject unsafe/invalid LLM output, recover locally
     else:
         llm_error = "API key not configured; using local fallback."
 
     if not answer:
-        answer = local_response(state, intent, text, selected_q)
+        answer = local_response(state, intent, text, selected_q, trace)
 
     if intent == "hint":
         q = current_meta(state)
@@ -583,9 +629,13 @@ def model_node(state: State) -> dict[str, Any]:
         "language": language,
         "llm_response": bool(llm_available() and answer),
         "model": os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
+        "tool_calls": trace,
+        "pending_profile": pending,
     })
     if llm_error:
         debug["llm_error"] = llm_error
+    if guard_reason:
+        debug["guard_rejected"] = guard_reason
 
     return {
         "messages": [AIMessage(content=answer)],
@@ -598,7 +648,36 @@ def model_node(state: State) -> dict[str, Any]:
         "language": language,
         "requested_difficulty": state.get("requested_difficulty", ""),
         "debug": debug,
+        "pending_profile": pending,
     }
+
+
+def approve_profile(state: State) -> dict[str, Any]:
+    """Human-in-the-loop step: long-term memory is only written after the user approves."""
+    changes = state.get("pending_profile") or {}
+    if not changes:
+        return {}
+    decision = interrupt({
+        "type": "profile_update",
+        "changes": changes,
+        "question": "Save these details to your long-term profile?",
+    })
+    approved = decision is True or str(decision).strip().lower() in {"yes", "y", "approve", "true"}
+    debug = dict(state.get("debug", {}))
+    debug["route"] = "approve_profile"
+    debug["tool_calls"] = []
+    debug["profile_approval"] = "approved" if approved else "rejected"
+    if approved:
+        save_profile(changes)
+        saved = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in changes.items())
+        msg = f"✅ Saved to your profile ({saved})."
+    else:
+        msg = "👍 Okay, I won't save that to your profile."
+    return {"pending_profile": {}, "messages": [AIMessage(content=msg)], "debug": debug}
+
+
+def after_answer(state: State) -> str:
+    return "approve_profile" if state.get("pending_profile") else END
 
 
 builder = StateGraph(State)
@@ -616,8 +695,10 @@ builder.add_conditional_edges(
     lambda state: state["intent"],
     {name: name for name in NODE_NAMES},
 )
+builder.add_node("approve_profile", approve_profile)
 for node_name in NODE_NAMES:
-    builder.add_edge(node_name, END)
+    builder.add_conditional_edges(node_name, after_answer, ["approve_profile", END])
+builder.add_edge("approve_profile", END)
 
 graph = builder.compile(checkpointer=checkpointer, store=store)
 
@@ -631,6 +712,33 @@ def _state(thread_id: str) -> dict[str, Any]:
         return graph.get_state({"configurable": {"thread_id": thread_id}}).values or {}
     except Exception:
         return {}
+
+
+def _config(thread_id: str) -> dict[str, Any]:
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def pending_approval(thread_id: str) -> dict[str, Any] | None:
+    """Return the interrupt payload if this thread is waiting for the user's approval."""
+    try:
+        snapshot = graph.get_state(_config(thread_id))
+    except Exception:
+        return None
+    for task in snapshot.tasks:
+        for item in getattr(task, "interrupts", ()) or ():
+            return item.value
+    return None
+
+
+def resume(thread_id: str, approved: bool) -> None:
+    graph.invoke(Command(resume=approved), _config(thread_id))
+
+
+def send_message(thread_id: str, text: str) -> None:
+    """Send a user message. A new message while approval is pending counts as "no"."""
+    if pending_approval(thread_id):
+        resume(thread_id, False)
+    graph.invoke({"messages": [HumanMessage(content=text)]}, _config(thread_id))
 
 
 def get_thread(thread_id: str) -> list[dict[str, str]]:
@@ -691,4 +799,7 @@ PROGRESS --> END
 EXPLAIN --> END
 ATTEMPT --> END
 LANGUAGE --> END
+CHAT & PRACTICE & HINT & ATTEMPT & EXPLAIN -.->|new profile facts| APPROVE{{Human approval<br/>interrupt}}
+APPROVE -->|approved: save to store| END
+APPROVE -->|rejected: discard| END
 """
